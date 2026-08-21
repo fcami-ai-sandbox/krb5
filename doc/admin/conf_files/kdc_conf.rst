@@ -570,7 +570,7 @@ The following tags may be specified in a [dbmodules] subsection:
 
 **max_readers**
     This LMDB-specific tag indicates the maximum number of concurrent
-    reading processes for the databases.  The default value is 128.
+    reading processes for the databases.  The default value is 126.
     New in release 1.17.
 
 **nosync**

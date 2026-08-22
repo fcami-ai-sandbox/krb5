@@ -178,6 +178,7 @@ check-pytests: responder s2p s4u2proxy unlockiter s4u2self
 	$(RUNPYTEST) $(srcdir)/t_etype_info.py $(PYTESTFLAGS)
 	$(RUNPYTEST) $(srcdir)/t_bogus_kdc_req.py $(PYTESTFLAGS)
 	$(RUNPYTEST) $(srcdir)/t_kdc_log.py $(PYTESTFLAGS)
+	$(RUNPYTEST) $(srcdir)/t_workers.py $(PYTESTFLAGS)
 	$(RUNPYTEST) $(srcdir)/t_proxy.py $(PYTESTFLAGS)
 	$(RUNPYTEST) $(srcdir)/t_unlockiter.py $(PYTESTFLAGS)
 	$(RUNPYTEST) $(srcdir)/t_errmsg.py $(PYTESTFLAGS)

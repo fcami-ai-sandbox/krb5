@@ -287,6 +287,12 @@ Scripts may use the following realm methods and attributes:
 * realm.stop_kdc(): Stop the krb5kdc process.  Errors if no KDC is
   running.
 
+* realm.start_kdc_daemon(args=[], env=None): Start a krb5kdc process
+  without -n, so that it daemonizes as it would in production (needed
+  to test -w numworkers).  Returns a KdcDaemon handle tracked by pid,
+  since the daemonized process is not a child of this one; pass it to
+  stop_kdc_daemon() or forget_kdc_daemon().
+
 * realm.start_kadmind(env=None): Start a kadmind process.  Errors if a
   kadmind is already running.
 
@@ -402,6 +408,7 @@ import socket
 import string
 import subprocess
 import sys
+import time
 
 # Used when most things go wrong (other than programming errors) so
 # that the user sees an error message rather than a Python traceback,
@@ -478,6 +485,41 @@ def password(name):
     return name + str(os.getpid())
 
 
+# Poll path for a line containing substr, appearing at or after byte
+# offset start (use this to ignore matches left over from a previous
+# process sharing the same log file).  Return the contents from start
+# onward once substr is found, or None if timeout seconds elapse first.
+def wait_for_log_message(path, substr, start=0, timeout=10, count=1):
+    deadline = time.time() + timeout
+    contents = ''
+    while True:
+        try:
+            with open(path, 'r') as f:
+                f.seek(start)
+                contents = f.read()
+        except IOError:
+            contents = ''
+        if contents.count(substr) >= count or time.time() >= deadline:
+            break
+        time.sleep(0.05)
+    return contents if contents.count(substr) >= count else None
+
+
+# Poll for a (typically non-child) process to exit, by pid.  Return
+# True if it exited within timeout seconds, False if it is still alive
+# at the deadline.
+def wait_for_pid_exit(pid, timeout=10):
+    deadline = time.time() + timeout
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 def canonicalize_hostname(name, rdns=True):
     """Canonicalize name using DNS, optionally with reverse DNS."""
     try:
@@ -499,7 +541,7 @@ def canonicalize_hostname(name, rdns=True):
 # Exit handler which ensures processes are cleaned up and, on failure,
 # prints messages to help developers debug the problem.
 def _onexit():
-    global _daemons, _success, srctop, verbose
+    global _daemons, _kdc_daemons, _success, srctop, verbose
     global _debug, _stop_before, _stop_after, _shell_before, _shell_after
     if _debug or _stop_before or _stop_after or _shell_before or _shell_after:
         # Wait before killing daemons in case one is being debugged.
@@ -509,6 +551,11 @@ def _onexit():
     for proc in _daemons:
         os.kill(proc.pid, signal.SIGTERM)
         _check_daemon(proc)
+    for d in _kdc_daemons:
+        try:
+            os.kill(d.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     if not _success:
         print
         if not verbose:
@@ -931,6 +978,40 @@ def stop_daemon(proc):
     return await_daemon_exit(proc)
 
 
+# A krb5kdc process started without -n, as by start_kdc_daemon().  Such
+# a process daemonizes (see daemon(3)) and is therefore not a child of
+# this one, so we can't reap its exit status with wait(); track its
+# liveness by pid instead of fabricating a status we don't have.
+class KdcDaemon(object):
+    def __init__(self, pid):
+        self.pid = pid
+
+    def wait_exit(self, timeout=10):
+        return wait_for_pid_exit(self.pid, timeout)
+
+
+def _forget_kdc_daemon(d):
+    global _kdc_daemons
+    if d in _kdc_daemons:
+        _kdc_daemons.remove(d)
+
+
+# Terminate a krb5kdc daemon started with start_kdc_daemon().  Fail out
+# if it doesn't exit; unlike stop_daemon(), there is no real exit
+# status to check.
+def stop_kdc_daemon(d, timeout=10):
+    os.kill(d.pid, signal.SIGTERM)
+    if not d.wait_exit(timeout):
+        fail('krb5kdc daemon (pid %d) did not exit after SIGTERM' % d.pid)
+    _forget_kdc_daemon(d)
+
+
+# Stop tracking a krb5kdc daemon already known to have exited on its
+# own (for example, after a worker-crash test), without signaling it.
+def forget_kdc_daemon(d):
+    _forget_kdc_daemon(d)
+
+
 class K5Realm(object):
     """An object representing a functional krb5 test realm."""
 
@@ -1147,6 +1228,45 @@ class K5Realm(object):
         assert(self._kdc_proc is not None)
         stop_daemon(self._kdc_proc)
         self._kdc_proc = None
+
+    def start_kdc_daemon(self, args=[], env=None):
+        """Start krb5kdc without -n, so it daemonizes as it does in
+        production (necessary to exercise -w numworkers, which only
+        forks after daemonizing).  The daemonized process is not a
+        child of this one, so wait for it via its pid file instead of
+        via output on a pipe we can no longer read once it detaches.
+        Return a KdcDaemon handle for use with stop_kdc_daemon() or
+        forget_kdc_daemon()."""
+        global krb5kdc, _kdc_daemons
+        if env is None:
+            env = self.env
+        pid_path = os.path.join(self.testdir, 'kdc.pid')
+        if os.path.exists(pid_path):
+            os.remove(pid_path)
+        proc = subprocess.Popen([krb5kdc, '-P', pid_path] + args, env=env,
+                                stdin=null_input, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                universal_newlines=True)
+        # This process exits as soon as it forks into the background;
+        # reap it now and report any early failure (for instance, one
+        # happening before it daemonizes) instead of leaking a zombie.
+        out, dummy = proc.communicate()
+        if proc.returncode != 0:
+            fail('krb5kdc failed to start:\n' + out)
+        deadline = time.time() + 10
+        pid = None
+        while pid is None and time.time() < deadline:
+            try:
+                with open(pid_path, 'r') as f:
+                    pid = int(f.read().strip())
+            except (IOError, ValueError):
+                time.sleep(0.05)
+        if pid is None:
+            fail('krb5kdc did not create a pid file; a daemonized\n'
+                 'krb5kdc may still be running and holding its port')
+        d = KdcDaemon(pid)
+        _kdc_daemons.append(d)
+        return d
 
     def start_kadmind(self, env=None):
         global krb5kdc
@@ -1458,6 +1578,7 @@ _success = False
 _current_pass = None
 _current_db = None
 _daemons = []
+_kdc_daemons = []
 _parse_args()
 atexit.register(_onexit)
 signal.signal(signal.SIGINT, _onsigint)

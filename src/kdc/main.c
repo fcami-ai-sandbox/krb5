@@ -45,10 +45,17 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <sys/wait.h>
+#ifdef HAVE_SCHED_GETAFFINITY
+#include <sched.h>
+#endif
 
 #if defined(NEED_DAEMON_PROTO)
 extern int daemon(int, int);
 #endif
+
+/* Hard cap on the worker count selected by "-w auto", regardless of how
+ * many CPUs are detected. */
+#define MAX_AUTO_WORKERS 64
 
 static void usage (char *);
 
@@ -59,6 +66,7 @@ static void finish_realms (void);
 
 static int nofork = 0;
 static int workers = 0;
+static krb5_boolean workers_auto = FALSE;
 static int time_offset = 0;
 static const char *pid_file = NULL;
 static volatile int signal_received = 0;
@@ -733,7 +741,7 @@ usage(char *name)
             _("usage: %s [-x db_args]* [-d dbpathname] [-r dbrealmname]\n"
               "\t\t[-T time_offset] [-m] [-k masterenctype]\n"
               "\t\t[-M masterkeyname] [-p port] [-P pid_file]\n"
-              "\t\t[-n] [-w numworkers] [/]\n\n"
+              "\t\t[-n] [-w numworkers|auto] [/]\n\n"
               "where,\n"
               "\t[-x db_args]* - Any number of database specific arguments.\n"
               "\t\t\tLook at each database module documentation for "
@@ -897,9 +905,15 @@ initialize_realms(krb5_context kcontext, int argc, char **argv,
             nofork++;                   /* don't detach from terminal */
             break;
         case 'w':                       /* create multiple worker processes */
-            workers = atoi(optarg);
-            if (workers <= 0)
-                usage(argv[0]);
+            if (strcmp(optarg, "auto") == 0) {
+                workers_auto = TRUE;
+            } else {
+                workers = atoi(optarg);
+                if (workers <= 0)
+                    usage(argv[0]);
+                /* A later explicit count overrides an earlier "auto". */
+                workers_auto = FALSE;
+            }
             break;
         case 'k':                       /* enctype for master key */
             if (krb5_string_to_enctype(optarg, &menctype))
@@ -1007,6 +1021,36 @@ finish_realms(void)
 }
 
 /*
+ * Return the worker count to use for "-w auto", based on the number of
+ * CPUs available to this process.  Prefer sched_getaffinity(), which
+ * reflects any CPU affinity restriction in effect for the process (for
+ * instance, one imposed by taskset(1)); fall back to
+ * sysconf(_SC_NPROCESSORS_ONLN) on platforms without sched_getaffinity()
+ * or if it fails.  The result is capped at MAX_AUTO_WORKERS.
+ */
+static int
+auto_worker_count(void)
+{
+    long n = 0;
+
+#ifdef HAVE_SCHED_GETAFFINITY
+    {
+        cpu_set_t set;
+
+        if (sched_getaffinity(0, sizeof(set), &set) == 0)
+            n = CPU_COUNT(&set);
+    }
+#endif
+    if (n <= 0)
+        n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n <= 0)
+        n = 1;
+    if (n > MAX_AUTO_WORKERS)
+        n = MAX_AUTO_WORKERS;
+    return (int) n;
+}
+
+/*
   outline:
 
   process args & setup
@@ -1079,6 +1123,29 @@ int main(int argc, char **argv)
      * Scan through the argument list
      */
     initialize_realms(kcontext, argc, argv, &tcp_listen_backlog);
+
+    /*
+     * Resolve "-w auto" now, right after the first initialize_realms()
+     * call, since that is where -w is parsed and workers_auto is set (not,
+     * as it might seem, because anything here needs kcontext->profile:
+     * that has already been live since krb5int_init_context_kdc() above).
+     * initialize_realms() is called a second time below, after
+     * daemonizing, and re-parses argv from scratch; that second parse
+     * only ever assigns to workers directly (for an explicit "-w N", the
+     * same as it always has) or sets workers_auto again (for "-w auto"),
+     * and nothing after this point ever consults workers_auto again, so
+     * the value we resolve into workers here survives that second parse
+     * undisturbed.
+     */
+    if (workers_auto) {
+        workers = auto_worker_count();
+        if (workers <= 1) {
+            /* create_workers() logs the count in the forking case. */
+            krb5_klog_syslog(LOG_INFO, _("-w auto: one CPU available; "
+                                         "running single-process"));
+            workers = 0;
+        }
+    }
 
 #ifndef NOCACHE
     retval = kdc_init_lookaside(kcontext);

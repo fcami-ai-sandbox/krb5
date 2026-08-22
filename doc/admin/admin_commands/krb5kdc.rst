@@ -15,7 +15,7 @@ SYNOPSIS
 [**-m**]
 [**-r** *realm*]
 [**-n**]
-[**-w** *numworkers*]
+[**-w** *numworkers*\|\ **auto**]
 [**-P** *pid_file*]
 [**-T** *time_offset*]
 
@@ -64,13 +64,20 @@ numbers specified in the :ref:`kdcdefaults` section of
 :ref:`kdc.conf(5)`, but may be overridden by realm-specific values.
 If no value is given from any source, the default port is 88.
 
-The **-w** *numworkers* option tells the KDC to fork *numworkers*
-processes to listen to the KDC ports and process requests in parallel.
-The top level KDC process (whose pid is recorded in the pid file if
-the **-P** option is also given) acts as a supervisor.  The supervisor
-will relay SIGHUP signals to the worker subprocesses, and will
-terminate the worker subprocess if the it is itself terminated or if
-any other worker process exits.
+The **-w** *numworkers*\|\ **auto** option tells the KDC to fork
+*numworkers* processes to listen to the KDC ports and process requests
+in parallel.  The top level KDC process (whose pid is recorded in the
+pid file if the **-P** option is also given) acts as a supervisor.
+The supervisor will relay SIGHUP signals to the worker subprocesses,
+and will terminate the worker subprocess if the it is itself
+terminated or if any other worker process exits.
+
+If **auto** is given instead of a number, the KDC selects the worker
+count itself from the number of CPUs available to the process
+(reduced by any CPU affinity restriction in effect, such as one set by
+taskset(1)), up to a maximum of 64 workers.  If only one CPU (or none)
+is detected, the KDC runs single-process, the same as if **-w** were
+not given at all.
 
 The **-x** *db_args* option specifies database-specific arguments.
 See :ref:`Database Options <dboptions>` in :ref:`kadmin(1)` for

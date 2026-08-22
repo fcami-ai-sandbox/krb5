@@ -287,11 +287,13 @@ Scripts may use the following realm methods and attributes:
 * realm.stop_kdc(): Stop the krb5kdc process.  Errors if no KDC is
   running.
 
-* realm.start_kdc_daemon(args=[], env=None): Start a krb5kdc process
-  without -n, so that it daemonizes as it would in production (needed
-  to test -w numworkers).  Returns a KdcDaemon handle tracked by pid,
-  since the daemonized process is not a child of this one; pass it to
-  stop_kdc_daemon() or forget_kdc_daemon().
+* realm.start_kdc_daemon(args=[], env=None, prefix=[]): Start a
+  krb5kdc process without -n, so that it daemonizes as it would in
+  production (needed to test -w numworkers).  prefix, if given, is a
+  command such as ['taskset', '-c', '0'] to run krb5kdc through.
+  Returns a KdcDaemon handle tracked by pid, since the daemonized
+  process is not a child of this one; pass it to stop_kdc_daemon() or
+  forget_kdc_daemon().
 
 * realm.start_kadmind(env=None): Start a kadmind process.  Errors if a
   kadmind is already running.
@@ -1229,22 +1231,27 @@ class K5Realm(object):
         stop_daemon(self._kdc_proc)
         self._kdc_proc = None
 
-    def start_kdc_daemon(self, args=[], env=None):
+    def start_kdc_daemon(self, args=[], env=None, prefix=[]):
         """Start krb5kdc without -n, so it daemonizes as it does in
         production (necessary to exercise -w numworkers, which only
         forks after daemonizing).  The daemonized process is not a
         child of this one, so wait for it via its pid file instead of
         via output on a pipe we can no longer read once it detaches.
-        Return a KdcDaemon handle for use with stop_kdc_daemon() or
-        forget_kdc_daemon()."""
+        prefix, if given, is a command (such as ['taskset', '-c', '0'])
+        to exec krb5kdc through; since krb5kdc's daemon(3) call only
+        forks (it does not exec), properties that prefix established
+        (like CPU affinity) are inherited by the daemonized process and
+        its workers.  Return a KdcDaemon handle for use with
+        stop_kdc_daemon() or forget_kdc_daemon()."""
         global krb5kdc, _kdc_daemons
         if env is None:
             env = self.env
         pid_path = os.path.join(self.testdir, 'kdc.pid')
         if os.path.exists(pid_path):
             os.remove(pid_path)
-        proc = subprocess.Popen([krb5kdc, '-P', pid_path] + args, env=env,
-                                stdin=null_input, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(prefix + [krb5kdc, '-P', pid_path] + args,
+                                env=env, stdin=null_input,
+                                stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT,
                                 universal_newlines=True)
         # This process exits as soon as it forks into the background;

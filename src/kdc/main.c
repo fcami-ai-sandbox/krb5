@@ -57,6 +57,17 @@ extern int daemon(int, int);
  * many CPUs are detected. */
 #define MAX_AUTO_WORKERS 64
 
+/*
+ * Reader slots to reserve, out of an LMDB realm's max_readers, for
+ * processes other than the KDC that may open the same database
+ * concurrently: kadmind, kpropd, and kadmin.local.  The fourth slot
+ * covers two of those overlapping briefly (for example, an administrator
+ * running kadmin.local while kadmind is also up).  This is a fixed,
+ * conservative reservation rather than a count of processes actually
+ * running at any given moment.
+ */
+#define LMDB_READER_RESERVE 4
+
 static void usage (char *);
 
 static void initialize_realms(krb5_context kcontext, int argc, char **argv,
@@ -903,6 +914,62 @@ auto_worker_count(void)
 }
 
 /*
+ * Return the largest "-w auto" worker count that will not exhaust LMDB's
+ * reader table, or -1 if no realm this KDC serves uses LMDB, in which
+ * case the caller leaves its count alone.
+ *
+ * A worker holds a reader slot in *every* LMDB environment it has open --
+ * both the principal and the lockout environment of each served realm,
+ * per open_lmdb_env() in kdb_lmdb.c -- so the tightest realm governs the
+ * whole process and the minimum is correct, not the sum.
+ */
+static int
+lmdb_worker_budget(krb5_context kcontext, kdc_realm_t **realms, int nrealms)
+{
+    int i, budget = -1;
+
+    for (i = 0; i < nrealms; i++) {
+        const char *rname = realms[i]->realm_name;
+        char *section = NULL, *lib = NULL;
+        int max_readers, cap;
+
+        /* [realms] <rname> database_module = <section>, defaulting to the
+         * realm name itself, exactly as kdb_get_library_name() does. */
+        if (profile_get_string(kcontext->profile, KDB_REALM_SECTION, rname,
+                               KDB_MODULE_POINTER, rname, &section) != 0)
+            continue;
+
+        /* [dbmodules] <section> db_library = <lib>, defaulting to db2. */
+        if (profile_get_string(kcontext->profile, KDB_MODULE_SECTION,
+                               section, KDB_LIB_POINTER, "db2", &lib) != 0) {
+            profile_release_string(section);
+            continue;
+        }
+
+        if (strcmp(lib, "klmdb") == 0) {
+            if (profile_get_integer(kcontext->profile, KDB_MODULE_SECTION,
+                                    section, KRB5_CONF_MAX_READERS, 0,
+                                    &max_readers) != 0)
+                max_readers = 0;
+            /* An unset max_readers leaves LMDB's own default of 126 in
+             * effect, which MAX_AUTO_WORKERS is well below, so there is
+             * nothing to cap. */
+            if (max_readers > 0) {
+                cap = max_readers - LMDB_READER_RESERVE;
+                if (cap < 0)
+                    cap = 0;
+                if (budget < 0 || cap < budget)
+                    budget = cap;
+            }
+        }
+
+        profile_release_string(section);
+        profile_release_string(lib);
+    }
+    return budget;
+}
+
+/*
   outline:
 
   process args & setup
@@ -977,24 +1044,40 @@ int main(int argc, char **argv)
     initialize_realms(kcontext, argc, argv, &tcp_listen_backlog);
 
     /*
-     * Resolve "-w auto" now, right after the first initialize_realms()
-     * call, since that is where -w is parsed and workers_auto is set (not,
-     * as it might seem, because anything here needs kcontext->profile:
-     * that has already been live since krb5int_init_context_kdc() above).
-     * initialize_realms() is called a second time below, after
-     * daemonizing, and re-parses argv from scratch; that second parse
-     * only ever assigns to workers directly (for an explicit "-w N", the
-     * same as it always has) or sets workers_auto again (for "-w auto"),
-     * and nothing after this point ever consults workers_auto again, so
-     * the value we resolve into workers here survives that second parse
-     * undisturbed.
+     * Resolve "-w auto" now: initialize_realms() is where -w is parsed,
+     * and it has just populated shandle.kdc_realmlist, which the LMDB
+     * step below needs.  (kcontext->profile has been live for longer,
+     * since krb5int_init_context_kdc() above.)
+     *
+     * initialize_realms() runs again after daemonizing and re-parses
+     * argv, but that parse only re-sets workers_auto or reassigns
+     * workers for an explicit -w N, and nothing past this point reads
+     * workers_auto, so the count resolved here survives it.
      */
     if (workers_auto) {
+        int lmdb_budget;
+
         workers = auto_worker_count();
+
+        /*
+         * A worker holds a reader slot in every LMDB environment of every
+         * realm it serves, so forking more workers than max_readers
+         * allows would eventually fail requests with MDB_READERS_FULL.
+         * lmdb_worker_budget() returns -1 when no served realm uses LMDB,
+         * so this only ever lowers the count and never applies to a db2
+         * or LDAP-only KDC.
+         */
+        lmdb_budget = lmdb_worker_budget(kcontext, shandle.kdc_realmlist,
+                                         shandle.kdc_numrealms);
+        if (lmdb_budget >= 0 && lmdb_budget < workers) {
+            krb5_klog_syslog(LOG_INFO,
+                             _("LMDB max_readers limits the worker count "
+                               "to %d"), lmdb_budget);
+            workers = lmdb_budget;
+        }
         if (workers <= 1) {
             /* create_workers() logs the count in the forking case. */
-            krb5_klog_syslog(LOG_INFO, _("-w auto: one CPU available; "
-                                         "running single-process"));
+            krb5_klog_syslog(LOG_INFO, _("-w auto: running single-process"));
             workers = 0;
         }
     }

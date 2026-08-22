@@ -573,6 +573,11 @@ The following tags may be specified in a [dbmodules] subsection:
     reading processes for the databases.  The default value is 128.
     New in release 1.17.
 
+    Setting this tag also limits the worker count krb5kdc chooses for
+    **-w auto**, to this value less a small reserve for other processes
+    which open the same database.  Raise it if you want more workers
+    than that allows.
+
 **nosync**
     This LMDB-specific tag can be set to improve the throughput of
     kadmind and other administrative agents, at the expense of

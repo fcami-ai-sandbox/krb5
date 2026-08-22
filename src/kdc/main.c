@@ -439,6 +439,17 @@ on_monitor_sighup(int signo)
 }
 
 /*
+ * This handler deliberately records nothing.  It exists only so that SIGCHLD
+ * has a caught disposition, since sigsuspend() does not wake for a signal
+ * whose disposition is to be ignored.  The waitpid() call in the supervisor
+ * loop reports which worker exited, so there is no state to save here.
+ */
+static void
+on_monitor_sigchld(int signo)
+{
+}
+
+/*
  * Kill the worker subprocesses given by pids[0..bound-1], skipping any which
  * are set to -1, and wait for them to exit (so that we know the ports are no
  * longer in use).
@@ -460,8 +471,14 @@ terminate_workers(pid_t *pids, int bound)
     /* Wait for them to exit. */
     while (num_active > 0) {
         pid = wait(&status);
-        if (pid >= 0)
-            num_active--;
+        if (pid < 0) {
+            if (errno == EINTR)
+                continue;
+            /* No children left to reap (ECHILD) or an unexpected error;
+             * either way, looping again would spin. */
+            break;
+        }
+        num_active--;
     }
 }
 
@@ -478,6 +495,7 @@ create_workers(verto_ctx *ctx, int num)
     pid_t pid, *pids;
 #ifdef POSIX_SIGNALS
     struct sigaction s_action;
+    sigset_t mask, oldmask;
 #endif /* POSIX_SIGNALS */
 
     /*
@@ -493,6 +511,26 @@ create_workers(verto_ctx *ctx, int num)
     (void) sigaction(SIGQUIT, &s_action, (struct sigaction *) NULL);
     s_action.sa_handler = on_monitor_sighup;
     (void) sigaction(SIGHUP, &s_action, (struct sigaction *) NULL);
+
+    /*
+     * Block the signals we forward or act on before forking, so that none
+     * of them can be delivered (and potentially missed) in the window
+     * between the fork loop completing and the supervisor loop below
+     * entering sigsuspend().  Each child restores the original mask as
+     * the first thing it does after fork() returns (see below); the
+     * supervisor keeps the block in place except while inside
+     * sigsuspend().
+     */
+    (void) sigemptyset(&mask);
+    (void) sigaddset(&mask, SIGHUP);
+    (void) sigaddset(&mask, SIGINT);
+    (void) sigaddset(&mask, SIGTERM);
+    (void) sigaddset(&mask, SIGQUIT);
+    (void) sigaddset(&mask, SIGCHLD);
+    (void) sigprocmask(SIG_BLOCK, &mask, &oldmask);
+    /* Discard a HUP taken between sigaction() and the block; it is
+     * inherited by every child otherwise. */
+    sighup_received = 0;
 #else  /* POSIX_SIGNALS */
     signal(SIGINT, on_monitor_signal);
     signal(SIGTERM, on_monitor_signal);
@@ -508,6 +546,20 @@ create_workers(verto_ctx *ctx, int num)
     for (i = 0; i < num; i++) {
         pid = fork();
         if (pid == 0) {
+#ifdef POSIX_SIGNALS
+            /*
+             * Restore the pre-fork signal mask before doing anything
+             * else.  loop_setup_signals() below installs libev's own
+             * handlers, but libev does not unblock the signals it
+             * manages, so a late or forgotten restore would leave SIGHUP
+             * and SIGTERM blocked in this worker for good: reload would
+             * stop working and the worker would never exit, wedging
+             * terminate_workers() in wait().  Restoring first also means
+             * a signal already pending at fork time is delivered here,
+             * which is what makes the check just below catch it.
+             */
+            (void) sigprocmask(SIG_SETMASK, &oldmask, NULL);
+#endif /* POSIX_SIGNALS */
             free(pids);
             if (!verto_reinitialize(ctx)) {
                 krb5_klog_syslog(LOG_ERR,
@@ -525,6 +577,27 @@ create_workers(verto_ctx *ctx, int num)
             if (signal_received)
                 exit(0);
 
+            /*
+             * A SIGHUP forwarded by the supervisor can arrive in the
+             * narrow window between the mask restore (or, on the
+             * non-POSIX_SIGNALS path, since we never blocked at all)
+             * above and loop_setup_signals() finishing, while our
+             * inherited (and by now stale) on_monitor_sighup() handler
+             * is still the one installed.  That handler only sets
+             * sighup_received, which nothing in this worker ever reads,
+             * so unlike the signal_received case above there is no
+             * later check that would naturally notice it: the HUP would
+             * simply be lost, silently disabling config reload for this
+             * worker.  Re-raise it now that the real handler (or, with
+             * a signalfd back end, the signal's pending state itself)
+             * is in place, so it gets processed exactly as if it had
+             * arrived after this point instead of before it.
+             */
+            if (sighup_received) {
+                sighup_received = 0;
+                raise(SIGHUP);
+            }
+
             /* Return control to main() in the new worker process. */
             return 0;
         }
@@ -541,7 +614,78 @@ create_workers(verto_ctx *ctx, int num)
     /* We're going to use our own main loop here. */
     loop_free(ctx);
 
+#ifdef POSIX_SIGNALS
+    /*
+     * Install the SIGCHLD handler only now, after loop_free(ctx), so that
+     * no libev teardown triggered by that call can stomp its disposition.
+     * A handler is required here even though it does nothing at all:
+     * SIGCHLD's default disposition is to be ignored, and sigsuspend()
+     * never wakes for a signal whose disposition is ignore, so without
+     * one a dead worker would go unnoticed until some other signal
+     * happened to arrive.  The handler must never
+     * be SIG_IGN either: POSIX permits (and Linux implements) SIG_IGN on
+     * SIGCHLD suppressing zombie creation entirely, which would make the
+     * waitpid() below fail with ECHILD instead of reaping the worker.
+     * SIGCHLD was already added to the blocked set above; it needs to be
+     * both blocked and caught for sigsuspend() to work correctly here:
+     * blocked-but-not-caught is equivalent to the default ignore
+     * disposition as far as sigsuspend() is concerned, while
+     * caught-but-not-blocked would reopen the very race this change is
+     * fixing, since a SIGCHLD delivered between the waitpid() call and
+     * the sigsuspend() call below would be lost.
+     */
+    s_action.sa_handler = on_monitor_sigchld;
+    (void) sigaction(SIGCHLD, &s_action, (struct sigaction *) NULL);
+
     /* Supervise the worker processes. */
+    while (!signal_received) {
+        /*
+         * Propagate a pending HUP signal to worker processes.  This is
+         * checked here, before the non-blocking waitpid() below, while
+         * our signal-blocking mask is still in effect, so a HUP that
+         * arrives after this check but before we reach sigsuspend() is
+         * still guaranteed to be noticed: it stays pending against the
+         * mask and wakes sigsuspend() immediately instead of being lost.
+         */
+        if (sighup_received) {
+            sighup_received = 0;
+            for (i = 0; i < num; i++) {
+                if (pids[i] != -1)
+                    kill(pids[i], SIGHUP);
+            }
+        }
+
+        /* Check for an exited worker without blocking. */
+        pid = waitpid(-1, &status, WNOHANG);
+        if (pid > 0) {
+            krb5_klog_syslog(LOG_ERR, _("worker %ld exited with status %d"),
+                             (long) pid, status);
+
+            /* Remove the pid from the table. */
+            for (i = 0; i < num; i++) {
+                if (pids[i] == pid)
+                    pids[i] = -1;
+            }
+
+            /* When one worker process exits, terminate them all, so that
+             * KDC crashes behave similarly with or without worker
+             * processes. */
+            break;
+        } else if (pid == 0) {
+            /*
+             * No worker has exited yet.  Atomically restore the pre-block
+             * mask and wait for a signal; sigsuspend() re-establishes our
+             * blocked mask once a signal has been caught, so we're back
+             * to a safe state on every iteration.
+             */
+            (void) sigsuspend(&oldmask);
+        } else {
+            /* ECHILD, in practice.  Signals are blocked and WNOHANG
+             * cannot return EINTR, so there is nothing to retry. */
+            break;
+        }
+    }
+#else  /* POSIX_SIGNALS */
     while (!signal_received) {
         /* Wait until a worker process exits or we get a signal. */
         pid = wait(&status);
@@ -569,6 +713,10 @@ create_workers(verto_ctx *ctx, int num)
             }
         }
     }
+#endif /* POSIX_SIGNALS */
+#ifdef POSIX_SIGNALS
+    (void) sigprocmask(SIG_SETMASK, &oldmask, NULL);
+#endif
     if (signal_received)
         krb5_klog_syslog(LOG_INFO, _("signal %d received in supervisor"),
                          signal_received);

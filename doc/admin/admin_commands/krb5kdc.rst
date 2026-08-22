@@ -79,6 +79,13 @@ taskset(1)), up to a maximum of 64 workers.  If only one CPU (or none)
 is detected, the KDC runs single-process, the same as if **-w** were
 not given at all.
 
+If a realm the KDC serves uses the LMDB database backend and sets
+**max_readers** (see :ref:`kdc.conf(5)`), the worker count is further
+limited to that value less a small reserve of reader slots for other
+processes which open the same database, such as kadmind and kpropd.
+Each worker holds a reader slot of its own.  The lowest limit among the
+served realms applies.
+
 The **-x** *db_args* option specifies database-specific arguments.
 See :ref:`Database Options <dboptions>` in :ref:`kadmin(1)` for
 supported arguments.

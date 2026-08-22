@@ -84,6 +84,40 @@ else:
         fail('KDC did not create exactly two workers under taskset -c 0-1')
     stop_kdc_daemon(d)
 
+# Regression test for the LMDB cap wrongly applying to a non-LMDB (here,
+# db2) realm.  The realm below sets max_readers deliberately low while
+# using the db2 backend, which has no reader table and no such limit:
+# "-w auto" must ignore the setting entirely and land on exactly the
+# affinity-derived count.  Leaving max_readers unset would not test
+# anything here, since an LMDB-shaped default of 126 minus the reserve
+# still exceeds the CPU count on any ordinary host, so a KDC that wrongly
+# applied it would pass unnoticed.
+mark('-w auto is not capped by LMDB reasoning for a db2 realm')
+try:
+    affinity_cpus = min(len(os.sched_getaffinity(0)), 64)
+except (AttributeError, OSError):
+    affinity_cpus = 0
+if affinity_cpus <= 1:
+    skipped('-w auto db2-not-capped-by-LMDB test',
+            'host has too few CPUs (%d) available to this process to '
+            'distinguish single-process fallback from a real count' %
+            affinity_cpus)
+else:
+    realm.stop()
+    realm = K5Realm(start_kdc=False, get_creds=False, create_user=False,
+                    create_host=False,
+                    kdc_conf={'logging': {'debug': 'true'},
+                              'dbmodules': {'db': {'max_readers': '10'}}})
+    mark_pos = logend()
+    d = realm.start_kdc_daemon(['-w', 'auto'])
+    if wait_for_log_message(logfile,
+                            'creating %d worker processes' % affinity_cpus,
+                            mark_pos) is None:
+        fail('KDC (db2 backend) was unexpectedly capped below the '
+             'affinity-derived worker count (%d) by a max_readers setting '
+             'that does not apply to db2' % affinity_cpus)
+    stop_kdc_daemon(d)
+
 mark('-w propagates SIGHUP to workers')
 mark_pos = logend()
 d = realm.start_kdc_daemon(['-w', '2'])
@@ -132,5 +166,75 @@ else:
     if not wait_for_pid_exit(sibling, 5):
         fail('Supervisor did not terminate the sibling worker')
     forget_kdc_daemon(d)
+
+# "-w auto" must also cap the worker count using the LMDB backend's
+# max_readers setting, but only for a realm that actually uses LMDB: each
+# worker process is a full KDC process, and holds a reader slot in every
+# LMDB environment it has open, so forking more workers than max_readers
+# (less a reserve for kadmind/kpropd/kadmin.local) can support risks
+# MDB_READERS_FULL at runtime.  This needs klmdb.so to actually be built;
+# skip loudly (not silently) if it isn't.  This is last in the file since
+# it replaces "realm" with an LMDB-backed one (freeing up its testdir and
+# ports first, the same way other multi-realm *.py tests do), and nothing
+# after this point needs the db2 realm used above.
+if runenv.have_lmdb != 'yes':
+    skipped('-w auto LMDB max_readers cap test', 'LMDB support not built')
+else:
+    # Mirrors LMDB_READER_RESERVE in kdc/main.c, only so this test can
+    # compute the worker count "-w auto" is expected to settle on; the
+    # test doesn't otherwise rely on the KDC's internals.
+    lmdb_reserve = 4
+    lmdb_max_readers = 10
+    lmdb_expected = lmdb_max_readers - lmdb_reserve
+
+    try:
+        affinity_cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        affinity_cpus = 0
+
+    if affinity_cpus <= lmdb_expected:
+        skipped('-w auto LMDB max_readers cap test',
+                'host has too few CPUs (%d) available to this process to '
+                'distinguish an LMDB max_readers-capped count (%d) from '
+                'the affinity-derived one' % (affinity_cpus, lmdb_expected))
+    else:
+        mark('-w auto is capped by LMDB max_readers')
+        realm.stop()
+        realm = K5Realm(start_kdc=False, get_creds=False, create_user=False,
+                        create_host=False,
+                        kdc_conf={'logging': {'debug': 'true'},
+                                  'dbmodules': {'db': {
+                                      'db_library': 'klmdb',
+                                      'max_readers': str(lmdb_max_readers),
+                                      'nosync': 'true'}}})
+        mark_pos = logend()
+        d = realm.start_kdc_daemon(['-w', 'auto'])
+        if wait_for_log_message(logfile, 'creating %d worker processes' %
+                                lmdb_expected, mark_pos) is None:
+            fail('KDC did not cap the auto-detected worker count to LMDB '
+                 'max_readers (max_readers=%d, expected %d workers with '
+                 '%d CPUs available)' %
+                 (lmdb_max_readers, lmdb_expected, affinity_cpus))
+        stop_kdc_daemon(d)
+
+        # max_readers at or below the reserve leaves no budget at all, so
+        # the KDC must fall back to a single process rather than being
+        # raised to some minimum that would exceed the cap.
+        mark('-w auto runs single-process when max_readers is tiny')
+        realm.stop()
+        realm = K5Realm(start_kdc=False, get_creds=False, create_user=False,
+                        create_host=False,
+                        kdc_conf={'logging': {'debug': 'true'},
+                                  'dbmodules': {'db': {
+                                      'db_library': 'klmdb',
+                                      'max_readers': str(lmdb_reserve),
+                                      'nosync': 'true'}}})
+        mark_pos = logend()
+        d = realm.start_kdc_daemon(['-w', 'auto'])
+        if wait_for_log_message(logfile, 'running single-process',
+                                mark_pos) is None:
+            fail('KDC did not fall back to single-process with '
+                 'max_readers=%d' % lmdb_reserve)
+        stop_kdc_daemon(d)
 
 success('KDC worker process tests')

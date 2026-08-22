@@ -571,7 +571,15 @@ The following tags may be specified in a [dbmodules] subsection:
 **max_readers**
     This LMDB-specific tag indicates the maximum number of concurrent
     reading processes for the databases.  The default value is 126.
+    The limit applies to each of the two LMDB environments the module
+    opens (the principal database and, unless lockout tracking is
+    disabled, the lockout database) rather than to both together.
     New in release 1.17.
+
+    Setting this tag also limits the worker count krb5kdc chooses for
+    **-w auto**, to this value less a small reserve for other processes
+    which open the same database.  Raise it if you want more workers
+    than that allows.
 
 **nosync**
     This LMDB-specific tag can be set to improve the throughput of

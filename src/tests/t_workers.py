@@ -1,11 +1,13 @@
 from k5test import *
 
-# Characterization tests for krb5kdc's -w numworkers option, which had
-# no test coverage before this file.  -w only takes effect once
-# krb5kdc daemonizes, so these tests start it without -n via
-# start_kdc_daemon() and assert against the KDC log (kdc.log), since
-# the daemonized process's stdout is redirected away before we can
-# read it, and it isn't a child process we can wait() on.
+# Characterization tests for krb5kdc's -w numworkers option (including
+# "-w auto", which detects the worker count from the CPUs available to
+# the process), which had no test coverage before this file.  -w only
+# takes effect once krb5kdc daemonizes, so these tests start it
+# without -n via start_kdc_daemon() and assert against the KDC log
+# (kdc.log), since the daemonized process's stdout is redirected away
+# before we can read it, and it isn't a child process we can wait()
+# on.
 
 realm = K5Realm(start_kdc=False, get_creds=False,
                 kdc_conf={'logging': {'debug': 'true'}})
@@ -28,6 +30,59 @@ stop_kdc_daemon(d)
 mark('-w with invalid worker counts')
 for badarg in ('0', '-1', 'notanumber'):
     realm.run([krb5kdc, '-w', badarg], expected_code=1, expected_msg='usage:')
+
+# Derive the count "-w auto" should settle on independently of the KDC.
+# Matching the full "creating %d worker processes" wording matters: a bare
+# 'creating' also matches the "creating worker processes" failure message
+# kdc_err() writes to the same log, so a KDC that failed to fork would
+# otherwise pass.
+try:
+    auto_expected = min(len(os.sched_getaffinity(0)), 64)
+except (AttributeError, OSError):
+    auto_expected = None
+
+mark('-w auto detects a worker count and serves requests')
+mark_pos = logend()
+d = realm.start_kdc_daemon(['-w', 'auto'])
+if auto_expected is None:
+    skipped('-w auto worker-count assertion', 'cannot read CPU affinity')
+else:
+    needle = ('running single-process' if auto_expected <= 1
+              else 'creating %d worker processes' % auto_expected)
+    if wait_for_log_message(logfile, needle, mark_pos) is None:
+        fail('KDC did not log the expected -w auto decision: %s' % needle)
+realm.kinit(realm.user_princ, password('user'))
+stop_kdc_daemon(d)
+
+# The remaining -w auto tests need taskset to control how many CPUs the
+# KDC sees, so that the detected count is deterministic.  Skip loudly
+# (rather than silently asserting nothing) if it isn't available.
+taskset = which('taskset')
+try:
+    have_cpus_01 = {0, 1} <= os.sched_getaffinity(0)
+except (AttributeError, OSError):
+    have_cpus_01 = False
+if taskset is None:
+    skipped('-w auto CPU-count tests', 'taskset not found')
+elif not have_cpus_01:
+    skipped('-w auto CPU-count tests',
+            'CPUs 0 and 1 are not both in this process\'s affinity mask')
+else:
+    mark('-w auto with a single available CPU runs single-process')
+    mark_pos = logend()
+    d = realm.start_kdc_daemon(['-w', 'auto'], prefix=[taskset, '-c', '0'])
+    if wait_for_log_message(logfile, 'running single-process',
+                            mark_pos) is None:
+        fail('KDC did not log single-process mode under taskset -c 0')
+    stop_kdc_daemon(d)
+
+    mark('-w auto with two available CPUs creates two workers')
+    mark_pos = logend()
+    d = realm.start_kdc_daemon(['-w', 'auto'], prefix=[taskset, '-c', '0-1'])
+    if wait_for_log_message(logfile, 'creating 2 worker processes',
+                            mark_pos) is None:
+        fail('KDC did not create exactly two workers under taskset -c 0-1')
+    stop_kdc_daemon(d)
 
 mark('-w propagates SIGHUP to workers')
 mark_pos = logend()
